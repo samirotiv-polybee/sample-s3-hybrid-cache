@@ -149,6 +149,73 @@ pub(crate) async fn append_lines_locked_or_fresh(
     Ok(fresh)
 }
 
+/// Read `cache_key`'s entries from one journal file, in file order.
+///
+/// Each key a consolidation cycle processes reads the journal files discovery listed for it,
+/// up to `KEY_CONCURRENCY_LIMIT` keys at once. Loading each file whole and parsing every line
+/// held one copy of the journal per key in flight and cost a JSON parse per line per key, so a
+/// journal that had fallen behind took memory and CPU in proportion to its size times the key
+/// count, and fell further behind. This reads the file a line at a time on the blocking pool
+/// and parses only the lines that contain the key's JSON string: memory is one line, and a
+/// line for another key costs a substring search.
+///
+/// The filter cannot drop one of the key's lines: every writer serializes entries with
+/// `serde_json`, which encodes a given string the same way every time, so each of the key's
+/// lines contains that encoding, quotes included. A line that contains it for another reason
+/// is parsed and compared on `cache_key` as before. Unparseable lines are skipped, as before,
+/// and so is a line that is not valid UTF-8, where the whole-file read skipped the file.
+async fn read_entries_for_key(
+    journal_file: &Path,
+    cache_key: &str,
+) -> std::io::Result<Vec<JournalEntry>> {
+    let path = journal_file.to_path_buf();
+    let key = cache_key.to_string();
+    tokio::task::spawn_blocking(move || read_entries_for_key_blocking(&path, &key))
+        .await
+        .map_err(std::io::Error::other)?
+}
+
+fn read_entries_for_key_blocking(
+    path: &Path,
+    cache_key: &str,
+) -> std::io::Result<Vec<JournalEntry>> {
+    use std::io::BufRead;
+
+    let needle = serde_json::to_string(cache_key).ok();
+    let mut reader = std::io::BufReader::with_capacity(64 * 1024, std::fs::File::open(path)?);
+    let mut buf = Vec::new();
+    let mut entries = Vec::new();
+    loop {
+        buf.clear();
+        if reader.read_until(b'\n', &mut buf)? == 0 {
+            break;
+        }
+        let Ok(line) = std::str::from_utf8(&buf) else {
+            debug!("Skipping journal line that is not UTF-8: file={:?}", path);
+            continue;
+        };
+        let line = line.trim_end_matches(['\n', '\r']);
+        if line.trim().is_empty() || needle.as_deref().is_some_and(|n| !line.contains(n)) {
+            continue;
+        }
+        match serde_json::from_str::<JournalEntry>(line) {
+            Ok(entry) => {
+                if entry.cache_key == cache_key {
+                    entries.push(entry);
+                }
+            }
+            Err(e) => {
+                // Parse errors can occur during concurrent writes on shared storage
+                debug!(
+                    "Failed to parse journal entry: file={:?}, error={}",
+                    path, e
+                );
+            }
+        }
+    }
+    Ok(entries)
+}
+
 /// After an append to a journal in `journals_dir` (`{cache_dir}/metadata/_journals`), keep
 /// `instance_id`'s `.ready` record current: see
 /// [`crate::staged_authority::refresh_ready_record_after_journal_append`]. Never waits.
@@ -933,27 +1000,8 @@ impl JournalManager {
         let mut all_entries = Vec::new();
 
         for journal_file in journal_files {
-            match tokio::fs::read_to_string(journal_file).await {
-                Ok(content) => {
-                    for line in content.lines() {
-                        if line.trim().is_empty() {
-                            continue;
-                        }
-                        match serde_json::from_str::<JournalEntry>(line) {
-                            Ok(entry) => {
-                                if entry.cache_key == cache_key {
-                                    all_entries.push(entry);
-                                }
-                            }
-                            Err(e) => {
-                                debug!(
-                                    "Failed to parse journal entry: file={:?}, error={}",
-                                    journal_file, e
-                                );
-                            }
-                        }
-                    }
-                }
+            match read_entries_for_key(journal_file, cache_key).await {
+                Ok(entries) => all_entries.extend(entries),
                 Err(e) => {
                     debug!(
                         "Failed to read journal file: file={:?}, error={}",
@@ -984,28 +1032,8 @@ impl JournalManager {
         // Read from all per-instance journal files
         let journal_files = self.find_all_journal_files(cache_key).await?;
         for journal_file in &journal_files {
-            match tokio::fs::read_to_string(journal_file).await {
-                Ok(content) => {
-                    for line in content.lines() {
-                        if line.trim().is_empty() {
-                            continue;
-                        }
-                        match serde_json::from_str::<JournalEntry>(line) {
-                            Ok(entry) => {
-                                if entry.cache_key == cache_key {
-                                    all_entries.push(entry);
-                                }
-                            }
-                            Err(e) => {
-                                // Parse errors can occur during concurrent writes on shared storage
-                                debug!(
-                                    "Failed to parse journal entry: file={:?}, error={}",
-                                    journal_file, e
-                                );
-                            }
-                        }
-                    }
-                }
+            match read_entries_for_key(journal_file, cache_key).await {
+                Ok(entries) => all_entries.extend(entries),
                 Err(e) => {
                     // Stale file handle and other transient errors are expected on shared storage
                     debug!(
@@ -1206,6 +1234,74 @@ mod tests {
             (3, 3, 3),
             "the append after a torn tail was glued onto it and lost"
         );
+    }
+
+    /// The per-key reads parse only lines that contain the key's JSON string, so they must
+    /// still return exactly the key's entries, in file order: none of a key that the key is a
+    /// prefix of, none of a key that merely appears in another field, every entry of a key
+    /// whose JSON form needs escapes, and the key's lines on either side of a line that does not
+    /// parse or is not UTF-8. Red side: drop the `entry.cache_key == cache_key` comparison in
+    /// `read_entries_for_key_blocking`, or search for the raw key rather than its JSON form.
+    #[tokio::test]
+    async fn per_key_reads_return_exactly_the_keys_entries() {
+        use std::io::Write;
+        let temp = TempDir::new().unwrap();
+        let jm = JournalManager::new(temp.path().to_path_buf(), "case-filter".to_string());
+        let plain = "bkt/obj";
+        let longer = "bkt/obj-2";
+        let escaped = "bkt/\"quoted\"\\back\tslash/é";
+        let mut mention = entry_a("bkt/other", 0);
+        mention.range_file_path = plain.to_string();
+
+        let path = jm.get_journal_path(plain).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut f = std::fs::File::create(&path).unwrap();
+        let mut line = |bytes: &[u8]| {
+            f.write_all(bytes).unwrap();
+            f.write_all(b"\n").unwrap();
+        };
+        let json = |e: &JournalEntry| serde_json::to_string(e).unwrap().into_bytes();
+        line(&json(&entry_a(plain, 0)));
+        line(&json(&entry_a(longer, 0)));
+        line(&json(&mention));
+        line(&json(&entry_a(escaped, 0)));
+        line(format!("{{\"cache_key\":\"{plain}\", not json").as_bytes());
+        line(&[b'{', 0xff, 0xfe, b'}']);
+        line(&json(&entry_a(plain, 100)));
+        line(&json(&entry_a(escaped, 100)));
+        drop(f);
+
+        let files = vec![path.clone()];
+        for (key, starts) in [
+            (plain, vec![0, 100]),
+            (longer, vec![0]),
+            (escaped, vec![0, 100]),
+        ] {
+            for (reader, entries) in [
+                (
+                    "get_entries_from_files",
+                    jm.get_entries_from_files(key, &files).await,
+                ),
+                (
+                    "get_all_entries_for_cache_key",
+                    jm.get_all_entries_for_cache_key(key).await,
+                ),
+            ] {
+                let entries = entries.unwrap();
+                assert!(
+                    entries.iter().all(|e| e.cache_key == key),
+                    "{reader} returned another key's entry for {key:?}"
+                );
+                assert_eq!(
+                    entries
+                        .iter()
+                        .map(|e| e.range_spec.start)
+                        .collect::<Vec<_>>(),
+                    starts,
+                    "{reader} entries for {key:?}"
+                );
+            }
+        }
     }
 
     #[test]

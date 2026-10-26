@@ -11,6 +11,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Every release up to and including 2.8.4 is in the [pre-3.0.0 changelog](changelog-pre-v3.md),
 which is closed. Look there for the history of any 0.x, 1.x or 2.x release.
 
+## [Unreleased]
+
+### Fixed
+
+- Previously, a consolidation cycle read each journal file whole and parsed every line once for every cache key it consolidated, 32 keys at a time, so a cycle held up to 32 copies of the journal in memory and its CPU grew with the key count times the journal size. A journal that fell behind therefore took more memory and drained more slowly the larger it grew: a 723 MiB journal held about 23 GiB, none of it counted by `max_inflight_buffer_bytes`, and the proxy was killed for memory, again on each restart while the journal remained. Each key now reads the journal a line at a time on the blocking pool and parses only lines that name it, so a cycle's memory is proportional to the journal, not 32 times it.
+
 ## [3.0.0] - 2026-10-21
 
 3.0.0 lets a fleet of proxies share one large cache on Amazon EFS, Amazon FSx or NFS and keeps that cache correct and within its size limit:
