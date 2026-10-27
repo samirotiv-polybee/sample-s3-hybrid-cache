@@ -286,6 +286,16 @@ path = "tests/eviction_lock_performance_test.rs"
 name = "hedged_fetch_wiring_test"
 path = "tests/hedged_fetch_wiring_test.rs"
 
+# hit_stream_memory_test: #[global_allocator] (one per binary) measuring the live heap of stalled cache hits
+[[test]]
+name = "hit_stream_memory_test"
+path = "tests/hit_stream_memory_test.rs"
+
+# hit_stream_throughput_test: compares cache-hit MB/s at two streaming settings; a second test in the binary would perturb the timing
+[[test]]
+name = "hit_stream_throughput_test"
+path = "tests/hit_stream_throughput_test.rs"
+
 # invalidate_meta_slot_lock_test: mutates the same process-global slot acquire wait budget (set_slot_acquire_wait_budget)
 [[test]]
 name = "invalidate_meta_slot_lock_test"

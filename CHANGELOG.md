@@ -6,6 +6,12 @@ this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `cache.disk_streaming_chunk_size` and `cache.disk_streaming_queue_depth` set the memory a cache hit streamed from disk holds. Previously, a hit read from one whole cached extent used fixed 1 MiB chunks and two queues of 4, so a hit whose client read more slowly than the disk held about 12.5 MiB. At 256 KiB and depth 2 it holds about 3 MiB and, on local NVMe, serves hits at least as fast. The defaults are unchanged. See [Disk streaming chunk size and queue depth](docs/CONFIGURATION.md#disk-streaming-chunk-size-and-queue-depth).
+
 ## Releases before 3.0.0
 
 Every release up to and including 2.8.4 is in the [pre-3.0.0 changelog](changelog-pre-v3.md),

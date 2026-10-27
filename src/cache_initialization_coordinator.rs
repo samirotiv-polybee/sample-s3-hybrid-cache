@@ -2442,7 +2442,9 @@ mod tests {
             eviction_target_percent: 80,
             full_object_check_threshold: 67_108_864, // 64 MiB
             disk_streaming_threshold: 1_048_576,     // 1 MiB
-            compression_batch_size: 1_048_576,       // 1 MiB
+            disk_streaming_chunk_size: 1_048_576,
+            disk_streaming_queue_depth: 4,
+            compression_batch_size: 1_048_576, // 1 MiB
             read_cache_enabled: true,
             bucket_settings_staleness_threshold: Duration::from_secs(60),
             evaluate_conditions_from_cache: true,

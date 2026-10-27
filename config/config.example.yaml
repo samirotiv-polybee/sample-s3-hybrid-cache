@@ -368,6 +368,14 @@ cache:
   # range responses under high concurrency.
   disk_streaming_threshold: 1048576  # 1 MiB in bytes
 
+  # Chunk size for a cache hit streamed from one whole cached extent (default: 1 MiB; range
+  # 64 KiB to 16 MiB), and how many chunks each of a streamed hit's two queues holds before
+  # the stage feeding it waits (default: 4; range 1 to 64). A hit whose client reads more
+  # slowly than the disk holds about (2 x depth + 4) x chunk: about 12.5 MiB at the
+  # defaults, about 3 MiB at 262144 and 2.
+  disk_streaming_chunk_size: 1048576
+  disk_streaming_queue_depth: 4
+
   # Size of the batches a cache-miss write groups S3 bytes into before compressing each
   # batch into one LZ4 frame (default: 1 MiB; range 64 KiB to 16 MiB). Larger batches
   # compress better with less per-frame overhead; smaller batches use less memory per
