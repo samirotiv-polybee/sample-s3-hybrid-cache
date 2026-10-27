@@ -271,6 +271,11 @@ path = "tests/connection_keepalive_benchmark.rs"
 name = "consolidation_cycle_cost_scaling_test"
 path = "tests/consolidation_cycle_cost_scaling_test.rs"
 
+# consolidation_journal_read_memory_test: #[global_allocator] (one per binary) measuring one consolidation cycle's peak heap
+[[test]]
+name = "consolidation_journal_read_memory_test"
+path = "tests/consolidation_journal_read_memory_test.rs"
+
 # eviction_activity_set_traversal_test: FAILED 2/3 grouped and passed 3/3 filtered to its own tests in the same binary: asserts a journal-set read count against a ceiling of 2, and the group's neighbours push it to 3
 [[test]]
 name = "eviction_activity_set_traversal_test"
