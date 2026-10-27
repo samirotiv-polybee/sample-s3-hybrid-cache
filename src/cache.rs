@@ -8771,8 +8771,10 @@ impl CacheManager {
             eviction_target_percent: 80,  // Default: reduce to 80% after eviction
             full_object_check_threshold: 67_108_864, // 64 MiB
             disk_streaming_threshold: 1_048_576, // 1 MiB
+            disk_streaming_chunk_size: 1_048_576,
+            disk_streaming_queue_depth: 4,
             compression_batch_size: 1_048_576, // 1 MiB
-            read_cache_enabled: true,     // Default enabled
+            read_cache_enabled: true,          // Default enabled
             bucket_settings_staleness_threshold: std::time::Duration::from_secs(60), // Default 60s
             evaluate_conditions_from_cache: true, // Default: serve If-Match from cache when ETag matches
             ram_cache_shard_count: 8,             // Default shard count

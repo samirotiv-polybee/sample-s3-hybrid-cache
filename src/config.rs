@@ -1233,6 +1233,14 @@ fn default_disk_streaming_threshold() -> u64 {
     1_048_576 // 1 MiB
 }
 
+fn default_disk_streaming_chunk_size() -> usize {
+    1_048_576 // 1 MiB
+}
+
+fn default_disk_streaming_queue_depth() -> usize {
+    4
+}
+
 /// Default compression batch size: 1 MiB
 /// Bytes are accumulated in RAM before being compressed and flushed as a single
 /// LZ4 frame. Larger batches improve compression ratio and throughput at the
@@ -1921,6 +1929,20 @@ pub struct CacheConfig {
     /// Requirement: 5.5
     #[serde(default = "default_disk_streaming_threshold")]
     pub disk_streaming_threshold: u64,
+    /// Chunk size in bytes for a cache hit streamed from one whole cached extent
+    /// (default: 1 MiB). The disk reader decodes this many bytes before handing them to the
+    /// client, so each such hit holds up to `(disk_streaming_queue_depth + 1)` chunks.
+    /// The read size from disk is set by the reader's buffer, not by this value. Reads that
+    /// slice or chain extents use 256 KiB chunks and are unaffected.
+    /// Valid range: 64 KiB to 16 MiB inclusive.
+    #[serde(default = "default_disk_streaming_chunk_size")]
+    pub disk_streaming_chunk_size: usize,
+    /// Decoded chunks a cache hit streamed from disk may queue for a client that is reading
+    /// more slowly than the disk (default: 4). The reader waits once this many are queued.
+    /// Applies to every streamed cache hit.
+    /// Valid range: 1 to 64 inclusive.
+    #[serde(default = "default_disk_streaming_queue_depth")]
+    pub disk_streaming_queue_depth: usize,
     /// Compression batch size in bytes (default: 1 MiB)
     /// Bytes are accumulated in RAM up to this size, then compressed as a single
     /// LZ4 frame and appended to the cache file. Larger batches improve compression
@@ -2071,6 +2093,8 @@ impl Default for CacheConfig {
             eviction_target_percent: default_eviction_target_percent(),
             full_object_check_threshold: default_full_object_check_threshold(),
             disk_streaming_threshold: default_disk_streaming_threshold(),
+            disk_streaming_chunk_size: default_disk_streaming_chunk_size(),
+            disk_streaming_queue_depth: default_disk_streaming_queue_depth(),
             compression_batch_size: default_compression_batch_size(),
             read_cache_enabled: default_read_cache_enabled(),
             evaluate_conditions_from_cache: default_evaluate_conditions_from_cache(),
@@ -2128,6 +2152,8 @@ impl CacheConfig {
     /// Currently validates:
     /// - `compression_batch_size` must be between 64 KiB and 16 MiB inclusive
     ///   (Requirements: 5.1, 5.2, 5.3, 5.4)
+    /// - `disk_streaming_chunk_size` must be between 64 KiB and 16 MiB inclusive
+    /// - `disk_streaming_queue_depth` must be between 1 and 64 inclusive
     /// - TTL fields must not exceed 315,360,000 seconds (10 years)
     ///   (Requirement: 8.5)
     pub fn validate(&self) -> std::result::Result<(), String> {
@@ -2140,6 +2166,25 @@ impl CacheConfig {
             return Err(format!(
                 "cache.compression_batch_size must be between {} and {} bytes, got {}",
                 MIN_COMPRESSION_BATCH_SIZE, MAX_COMPRESSION_BATCH_SIZE, self.compression_batch_size
+            ));
+        }
+
+        const MIN_DISK_STREAMING_CHUNK_SIZE: usize = 64 * 1024; // 64 KiB
+        const MAX_DISK_STREAMING_CHUNK_SIZE: usize = 16 * 1024 * 1024; // 16 MiB
+        if !(MIN_DISK_STREAMING_CHUNK_SIZE..=MAX_DISK_STREAMING_CHUNK_SIZE)
+            .contains(&self.disk_streaming_chunk_size)
+        {
+            return Err(format!(
+                "cache.disk_streaming_chunk_size must be between {} and {} bytes, got {}",
+                MIN_DISK_STREAMING_CHUNK_SIZE,
+                MAX_DISK_STREAMING_CHUNK_SIZE,
+                self.disk_streaming_chunk_size
+            ));
+        }
+        if !(1..=64).contains(&self.disk_streaming_queue_depth) {
+            return Err(format!(
+                "cache.disk_streaming_queue_depth must be between 1 and 64, got {}",
+                self.disk_streaming_queue_depth
             ));
         }
 
@@ -3233,8 +3278,10 @@ impl Default for Config {
                 eviction_target_percent: 80,                     // Reduce to 80% after eviction
                 full_object_check_threshold: 67_108_864,         // 64 MiB
                 disk_streaming_threshold: 1_048_576,             // 1 MiB
-                compression_batch_size: 1_048_576,               // 1 MiB
-                read_cache_enabled: true,                        // Read caching enabled by default
+                disk_streaming_chunk_size: 1_048_576,
+                disk_streaming_queue_depth: 4,
+                compression_batch_size: 1_048_576, // 1 MiB
+                read_cache_enabled: true,          // Read caching enabled by default
                 bucket_settings_staleness_threshold: Duration::from_secs(60), // 60 seconds
                 evaluate_conditions_from_cache: true, // Default: serve If-Match from cache; If-None-Match/etc still forward
                 ram_cache_shard_count: default_ram_cache_shard_count(),
@@ -8391,6 +8438,33 @@ metrics:
     }
 
     #[test]
+    fn disk_streaming_chunk_size_and_queue_depth_are_range_checked() {
+        for (chunk, depth, field) in [
+            (32 * 1024, 4, Some("disk_streaming_chunk_size")),
+            (32 * 1024 * 1024, 4, Some("disk_streaming_chunk_size")),
+            (1_048_576, 0, Some("disk_streaming_queue_depth")),
+            (1_048_576, 65, Some("disk_streaming_queue_depth")),
+            (64 * 1024, 1, None),
+            (256 * 1024, 2, None),
+            (16 * 1024 * 1024, 64, None),
+        ] {
+            let cfg = CacheConfig {
+                disk_streaming_chunk_size: chunk,
+                disk_streaming_queue_depth: depth,
+                ..CacheConfig::default()
+            };
+            match (cfg.validate(), field) {
+                (Err(err), Some(field)) => assert!(
+                    err.contains(field),
+                    "chunk={chunk} depth={depth}: error should name {field}, got: {err}"
+                ),
+                (Ok(()), None) => {}
+                (got, _) => panic!("chunk={chunk} depth={depth}: unexpected {got:?}"),
+            }
+        }
+    }
+
+    #[test]
     fn test_ttl_validation_get_ttl_exceeds_max() {
         // Requirement 8.5: TTL fields exceeding 315_360_000 seconds must be rejected.
         let cfg = CacheConfig {
@@ -10173,6 +10247,8 @@ mod rolling_validation_config_property_tests {
         assert!(config.cache.read_cache_enabled);
         assert!(config.cache.evaluate_conditions_from_cache);
         assert_eq!(config.cache.disk_streaming_threshold, 1_048_576);
+        assert_eq!(config.cache.disk_streaming_chunk_size, 1_048_576);
+        assert_eq!(config.cache.disk_streaming_queue_depth, 4);
         assert_eq!(config.cache.compression_batch_size, 1_048_576);
 
         // shared_storage sub-section

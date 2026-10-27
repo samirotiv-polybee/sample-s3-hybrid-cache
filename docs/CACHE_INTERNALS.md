@@ -434,7 +434,7 @@ Range Request → Check RAM cache (key: {cache_key}:range:{start}:{end})
              → RAM MISS + range < streaming threshold: Buffered path
                   → Load from disk, serve, promote to RAM cache
              → RAM MISS + range >= streaming threshold: Streaming path
-                  → Stream from disk in 512 KiB chunks
+                  → Stream from disk in cache.disk_streaming_chunk_size chunks
                   → Collect chunks during streaming
                   → Promote to RAM cache after completion
                   → Skip promotion if range exceeds max_ram_cache_size
@@ -449,7 +449,10 @@ Configuration:
 - Disk streaming threshold: `cache.disk_streaming_threshold`, default 1 MiB, based on the
   Content-Length header. It governs the disk read path only; the S3 response path has no
   threshold and streams whatever the size.
-- Chunk size for disk streaming: 512 KiB (as in the flow above).
+- Chunk size for disk streaming: `cache.disk_streaming_chunk_size`, default 1 MiB, for a read of
+  one whole cached extent; slice and chained reads use 256 KiB. Each of the two queues between
+  the disk and the connection holds `cache.disk_streaming_queue_depth` chunks, default 4. See
+  [Disk streaming chunk size and queue depth](CONFIGURATION.md#disk-streaming-chunk-size-and-queue-depth).
 
 ### Copies and allocation
 

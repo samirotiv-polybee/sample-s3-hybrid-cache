@@ -122,9 +122,9 @@ header; it is never queued. AWS SDKs retry 503 responses with backoff.
 
 #### Memory impact
 
-A streamed transfer uses about 5 MiB of memory whatever the object size:
+A streamed transfer uses a fixed amount of memory whatever the object size:
 
-- Cache hit: a 1 MiB decompression buffer plus up to four queued 1 MiB chunks.
+- Cache hit read from one whole cached extent: about `2 × cache.disk_streaming_queue_depth + 4` chunks of `cache.disk_streaming_chunk_size`, counting the HTTP write buffer, plus under 1 MiB for the disk reader. That is about 12.5 MiB at the defaults (1 MiB chunks, depth 4), and the full amount is held only while the client reads more slowly than the disk. See [Disk streaming chunk size and queue depth](#disk-streaming-chunk-size-and-queue-depth).
 - Cache miss: a 1 MiB receive buffer plus up to 4 MiB of pending cache writes.
 
 A range file written with 4 MiB LZ4 blocks holds about 8.25 MiB of decoder state per hit, which these figures omit. The proxy writes 64 KiB blocks and reads the larger ones; see [Compression](COMPRESSION.md).
@@ -132,7 +132,7 @@ A range file written with 4 MiB LZ4 blocks holds about 8.25 MiB of decoder state
 Size three memory budgets together. They add up, none covers another, and nothing enforces a
 combined ceiling:
 
-1. Streamed transfers: at most `max_concurrent_requests` × about 5 MiB per proxy.
+1. Streamed transfers: at most `max_concurrent_requests` × the per-transfer figure above.
 2. Buffered bodies, on the paths that hold a whole body or range in memory: bounded by
    [`server.max_inflight_buffer_bytes`](#in-flight-memory-ceiling). At its default of `0`
    this budget has no bound.
@@ -787,6 +787,18 @@ cache:
 ```
 
 A cached range at or above this size is streamed from disk in chunks instead of being read into memory whole. RAM cache hits are served from memory whatever this setting. Lower it when memory is short and many large ranges are served at once.
+
+### Disk streaming chunk size and queue depth
+
+```yaml
+cache:
+  disk_streaming_chunk_size: 1048576  # 1 MiB (default)
+  disk_streaming_queue_depth: 4       # (default)
+```
+
+A cache hit streamed from disk passes its bytes through two queues: from the disk reader to the response task, and from the response task to the HTTP connection. `disk_streaming_queue_depth` is how many chunks each queue holds before the stage feeding it waits. `disk_streaming_chunk_size` is the chunk size for a read of one whole cached extent; reads that slice or chain extents use 256 KiB chunks. Against a client that reads more slowly than the disk, a hit holds about `(2 × depth + 4) × chunk`, counting the HTTP write buffer, plus under 1 MiB for the disk reader: measured at 12.4 MiB at the defaults and 2.9 MiB at 256 KiB and depth 2 (`tests/hit_stream_memory_test.rs`).
+
+The chunk size does not set the size of disk reads, which go through a reader buffer of up to 256 KiB, so a smaller chunk changes only how the decoded bytes are handed on. On local NVMe, 256 KiB and depth 2 served cache hits at least as fast as the defaults (`tests/hit_stream_throughput_test.rs`). The ranges are `65536` (64 KiB) to `16777216` (16 MiB) for the chunk size and 1 to 64 for the depth, and startup rejects a value outside them.
 
 ### Compression batch size
 

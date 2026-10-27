@@ -6,16 +6,20 @@ this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## Releases before 3.0.0
-
-Every release up to and including 2.8.4 is in the [pre-3.0.0 changelog](changelog-pre-v3.md),
-which is closed. Look there for the history of any 0.x, 1.x or 2.x release.
-
 ## [Unreleased]
+
+### Added
+
+- `cache.disk_streaming_chunk_size` and `cache.disk_streaming_queue_depth` set the memory a cache hit streamed from disk holds. Previously, a hit read from one whole cached extent used fixed 1 MiB chunks and two queues of 4, so a hit whose client read more slowly than the disk held about 12.5 MiB. At 256 KiB and depth 2 it holds about 3 MiB and, on local NVMe, serves hits at least as fast. The defaults are unchanged. See [Disk streaming chunk size and queue depth](docs/CONFIGURATION.md#disk-streaming-chunk-size-and-queue-depth).
 
 ### Fixed
 
 - Previously, a consolidation cycle read each journal file whole and parsed every line once for every cache key it consolidated, 32 keys at a time, so a cycle held up to 32 copies of the journal in memory and its CPU grew with the key count times the journal size. A journal that fell behind therefore took more memory and drained more slowly the larger it grew: a 723 MiB journal held about 23 GiB, none of it counted by `max_inflight_buffer_bytes`, and the proxy was killed for memory, again on each restart while the journal remained. Each key now reads the journal a line at a time on the blocking pool and parses only lines that name it, so a cycle's memory is proportional to the journal, not 32 times it.
+
+## Releases before 3.0.0
+
+Every release up to and including 2.8.4 is in the [pre-3.0.0 changelog](changelog-pre-v3.md),
+which is closed. Look there for the history of any 0.x, 1.x or 2.x release.
 
 ## [3.0.0] - 2026-10-21
 

@@ -1174,6 +1174,10 @@ fn decode_lz4_frames_exact(compressed: &[u8], expected: u64) -> Option<Vec<u8>> 
 /// block. A buffer of this size absorbs both reads, at most this many bytes per concurrent read.
 const LZ4_RANGE_READER_CAPACITY: usize = 256 * 1024;
 
+/// Decoded chunks a streamed cache hit queues for its client when the caller does not say
+/// (`cache.disk_streaming_queue_depth` defaults to the same).
+pub const DEFAULT_STREAM_QUEUE_DEPTH: usize = 4;
+
 /// std's default `BufReader` capacity, the floor for a small file.
 const LZ4_RANGE_READER_MIN_CAPACITY: usize = 8 * 1024;
 
@@ -8086,9 +8090,10 @@ impl DiskCacheManager {
     /// `FrameDecoder` (looping over concatenated frames) and sends each decompressed chunk
     /// as it is produced. Neither mode holds the whole file in memory.
     ///
-    /// Chunks cross a 4-deep channel, so resident data is bounded by about
-    /// 4 × `chunk_size` per stream. Dropping the returned stream makes the blocking task's
-    /// next send fail, which stops the read.
+    /// Chunks cross a channel [`DEFAULT_STREAM_QUEUE_DEPTH`] deep, so resident data is bounded
+    /// by about (depth + 2) × `chunk_size` per stream: the queued chunks, the one being sent and
+    /// the decode buffer. Dropping the returned stream makes the blocking task's next send fail, which
+    /// stops the read.
     ///
     /// Returns a stream of Bytes chunks that can be used with StreamBody.
     ///
@@ -8122,16 +8127,41 @@ impl DiskCacheManager {
         chunk_size: usize,
         start_offset: u64,
     ) -> Result<(impl futures::Stream<Item = Result<bytes::Bytes>>, u64)> {
-        self.stream_range_data_from_with_capacity(range_spec, chunk_size, start_offset, None)
-            .await
+        self.stream_range_data_from_queued(
+            range_spec,
+            chunk_size,
+            DEFAULT_STREAM_QUEUE_DEPTH,
+            start_offset,
+        )
+        .await
     }
 
-    /// [`Self::stream_range_data_from`] with the LZ4 reader capacity given; `None` takes
-    /// [`lz4_range_reader_capacity`] of the file's length.
+    /// As [`Self::stream_range_data_from`], with at most `queue_depth` decoded chunks waiting
+    /// for the reader of the stream (`cache.disk_streaming_queue_depth`).
+    pub async fn stream_range_data_from_queued(
+        &self,
+        range_spec: &crate::cache_types::RangeSpec,
+        chunk_size: usize,
+        queue_depth: usize,
+        start_offset: u64,
+    ) -> Result<(impl futures::Stream<Item = Result<bytes::Bytes>>, u64)> {
+        self.stream_range_data_from_with_capacity(
+            range_spec,
+            chunk_size,
+            queue_depth,
+            start_offset,
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::stream_range_data_from_queued`] with the LZ4 reader capacity given; `None`
+    /// takes [`lz4_range_reader_capacity`] of the file's length.
     async fn stream_range_data_from_with_capacity(
         &self,
         range_spec: &crate::cache_types::RangeSpec,
         chunk_size: usize,
+        queue_depth: usize,
         start_offset: u64,
         reader_capacity: Option<usize>,
     ) -> Result<(impl futures::Stream<Item = Result<bytes::Bytes>>, u64)> {
@@ -8247,9 +8277,10 @@ impl DiskCacheManager {
             ));
         });
 
-        // Channel capacity of 4 provides backpressure: blocking task pauses when
-        // 4 chunks are buffered, bounding memory to 4 × chunk_size per request.
-        let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes>>(4);
+        // The channel's capacity provides backpressure: the blocking task pauses when
+        // `queue_depth` chunks are queued, bounding memory to (queue_depth + 2) × chunk_size
+        // per request with the chunk being sent and the decode buffer.
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes>>(queue_depth.max(1));
 
         tokio::task::spawn_blocking(move || {
             use crate::compression::CompressionAlgorithm;
@@ -11258,7 +11289,13 @@ mod lz4_reader_capacity_tests {
                     assert!(got.as_deref() == Some(&data[..]), "buffered {label}");
                     for (chunk, offset) in [(1_048_576, 0u64), (262_144, 3_000_001)] {
                         let (stream, skipped) = dcm
-                            .stream_range_data_from_with_capacity(&spec, chunk, offset, capacity)
+                            .stream_range_data_from_with_capacity(
+                                &spec,
+                                chunk,
+                                super::DEFAULT_STREAM_QUEUE_DEPTH,
+                                offset,
+                                capacity,
+                            )
                             .await
                             .unwrap();
                         let mut stream = std::pin::pin!(stream);

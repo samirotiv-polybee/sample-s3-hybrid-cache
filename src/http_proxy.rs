@@ -11618,6 +11618,7 @@ impl HttpProxy {
                     resolved,
                     None,
                     true,
+                    config.cache.disk_streaming_queue_depth,
                 )
                 .await
                 {
@@ -12411,14 +12412,16 @@ impl HttpProxy {
                 }
             };
 
-            // Stream range data from disk in 1 MiB chunks (was 512 KiB)
-            const DEFAULT_CHUNK_SIZE: usize = 1_048_576; // 1 MiB
+            // Stream range data from disk in `cache.disk_streaming_chunk_size` chunks, at most
+            // `cache.disk_streaming_queue_depth` of them queued on each channel below.
+            let chunk_size = config.cache.disk_streaming_chunk_size;
+            let queue_depth = config.cache.disk_streaming_queue_depth;
             let disk_open_start = Instant::now();
             match disk_cache
-                .stream_range_data(&disk_range_spec, DEFAULT_CHUNK_SIZE)
+                .stream_range_data_from_queued(&disk_range_spec, chunk_size, queue_depth, 0)
                 .await
             {
-                Ok(data_stream) => {
+                Ok((data_stream, _skipped)) => {
                     let disk_open_ms = disk_open_start.elapsed().as_millis();
                     drop(disk_cache);
 
@@ -12476,7 +12479,7 @@ impl HttpProxy {
                     // Mid-stream errors cause the sender to drop, terminating the connection (Requirement 5.7).
                     let (frame_tx, frame_rx) = mpsc::channel::<
                         std::result::Result<hyper::body::Frame<Bytes>, hyper::Error>,
-                    >(4);
+                    >(queue_depth.max(1));
 
                     // Prepare RAM cache promotion context (Requirements 2.2, 5.1, 5.2)
                     let max_ram_cache_size = config.cache.max_ram_cache_size;
@@ -12958,6 +12961,7 @@ impl HttpProxy {
                         resolved,
                         permit.clone(),
                         false,
+                        config.cache.disk_streaming_queue_depth,
                     )
                     .await
                     {
@@ -13014,6 +13018,7 @@ impl HttpProxy {
         resolved: &crate::bucket_settings::ResolvedSettings,
         permit: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
         full_object: bool,
+        queue_depth: usize,
     ) -> std::result::Result<Response<BoxBody<Bytes, hyper::Error>>, BufferedServeDegradeReason>
     {
         const SLICE_CHUNK_SIZE: usize = 256 * 1024;
@@ -13075,7 +13080,7 @@ impl HttpProxy {
             specs.push((spec, skip, take));
         }
         let first_stream = match disk_cache
-            .stream_range_data_from(&specs[0].0, SLICE_CHUNK_SIZE, specs[0].1)
+            .stream_range_data_from_queued(&specs[0].0, SLICE_CHUNK_SIZE, queue_depth, specs[0].1)
             .await
         {
             Ok(opened) => opened,
@@ -13116,8 +13121,9 @@ impl HttpProxy {
             });
         }
 
-        let (frame_tx, frame_rx) =
-            mpsc::channel::<std::result::Result<hyper::body::Frame<Bytes>, hyper::Error>>(4);
+        let (frame_tx, frame_rx) = mpsc::channel::<
+            std::result::Result<hyper::body::Frame<Bytes>, hyper::Error>,
+        >(queue_depth.max(1));
         tokio::spawn(async move {
             use futures::StreamExt;
             let mut first = Some(first_stream);
@@ -13127,7 +13133,12 @@ impl HttpProxy {
                     None => {
                         let dc = disk_cache_manager.read().await;
                         match dc
-                            .stream_range_data_from(&spec, SLICE_CHUNK_SIZE, skip)
+                            .stream_range_data_from_queued(
+                                &spec,
+                                SLICE_CHUNK_SIZE,
+                                queue_depth,
+                                skip,
+                            )
                             .await
                         {
                             Ok(opened) => opened,
@@ -13277,15 +13288,21 @@ impl HttpProxy {
             }
         };
 
-        // Smaller than the exact-match arm's 1 MiB: the disk stream reads ahead up to its
-        // 4-deep channel plus one chunk in hand plus its read buffer, and the bridge below
-        // holds 4 more frames, so resident bytes scale with ~10 x the chunk size. 256 KiB
+        // Smaller than the exact-match arm's 1 MiB default: the disk stream reads ahead up to
+        // its `cache.disk_streaming_queue_depth`-deep channel (4 by default) plus one chunk in
+        // hand plus its read buffer, and the bridge below holds as many frames again, so at
+        // the default depth resident bytes scale with ~10 x the chunk size. 256 KiB
         // keeps a slice well inside BUFFERED_OPERATION_BOUND; measured with 1 MiB chunks, a
         // 4 KiB slice grew the heap by 10.6-11.6 MB.
         const SLICE_CHUNK_SIZE: usize = 256 * 1024;
         let data_stream = match disk_range_spec {
             Some(spec) => match disk_cache
-                .stream_range_data_from(&spec, SLICE_CHUNK_SIZE, range_spec.start - extent.start)
+                .stream_range_data_from_queued(
+                    &spec,
+                    SLICE_CHUNK_SIZE,
+                    config.cache.disk_streaming_queue_depth,
+                    range_spec.start - extent.start,
+                )
                 .await
             {
                 Ok(opened) => Ok(opened),
@@ -13398,8 +13415,9 @@ impl HttpProxy {
         // Same mpsc bridge as the exact-match arm. Dropping `sliced` at the end of the
         // task (after the last byte, a send failure, or an error) drops the disk stream,
         // which stops its blocking reader.
-        let (frame_tx, frame_rx) =
-            mpsc::channel::<std::result::Result<hyper::body::Frame<Bytes>, hyper::Error>>(4);
+        let (frame_tx, frame_rx) = mpsc::channel::<
+            std::result::Result<hyper::body::Frame<Bytes>, hyper::Error>,
+        >(config.cache.disk_streaming_queue_depth.max(1));
         tokio::spawn(async move {
             use futures::StreamExt;
             let mut stream = std::pin::pin!(sliced);
@@ -24357,6 +24375,7 @@ mod head_listing_one_read_tests {
                 &resolved,
                 None,
                 false,
+                crate::disk_cache::DEFAULT_STREAM_QUEUE_DEPTH,
             )
             .await
             .ok(),
