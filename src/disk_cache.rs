@@ -3198,20 +3198,15 @@ impl DiskCacheManager {
             if !path.is_file() || path.extension().and_then(|e| e.to_str()) != Some("journal") {
                 continue;
             }
-            let Ok(content) = tokio::fs::read_to_string(&path).await else {
+            let Ok(entries) = crate::journal_manager::read_entries_for_key(&path, cache_key).await
+            else {
                 continue;
             };
-            for line in content.lines() {
-                let Ok(entry) = serde_json::from_str::<crate::journal_manager::JournalEntry>(line)
-                else {
-                    continue;
-                };
-                if entry.cache_key != cache_key
-                    || !matches!(
-                        entry.operation,
-                        crate::journal_manager::JournalOperation::Add
-                    )
-                {
+            for entry in entries {
+                if !matches!(
+                    entry.operation,
+                    crate::journal_manager::JournalOperation::Add
+                ) {
                     continue;
                 }
                 if let Some(m) = entry.object_metadata.as_ref() {
@@ -3342,30 +3337,21 @@ impl DiskCacheManager {
                 _ => continue,
             };
 
-            // Read and parse journal file
-            let content = match tokio::fs::read_to_string(&journal_path).await {
-                Ok(c) => c,
+            // This key's entries only, read a line at a time off the runtime's worker threads.
+            let entries = match crate::journal_manager::read_entries_for_key(
+                &journal_path,
+                cache_key,
+            )
+            .await
+            {
+                Ok(entries) => entries,
                 Err(e) => {
                     debug!("Failed to read journal file {:?}: {}", journal_path, e);
                     continue;
                 }
             };
 
-            for line in content.lines() {
-                if line.trim().is_empty() {
-                    continue;
-                }
-
-                let entry: crate::journal_manager::JournalEntry = match serde_json::from_str(line) {
-                    Ok(e) => e,
-                    Err(_) => continue,
-                };
-
-                // Check if this entry is for our cache key
-                if entry.cache_key != cache_key {
-                    continue;
-                }
-
+            for entry in entries {
                 // Check if the range overlaps with requested range
                 let range = &entry.range_spec;
                 let overlaps = requested_start <= range.end && range.start <= requested_end;
@@ -9826,30 +9812,19 @@ pub(crate) async fn unfolded_journal_add_ranges(
             _ => continue,
         };
 
-        let content = match tokio::fs::read_to_string(&journal_path).await {
-            Ok(c) => c,
-            Err(e) => {
-                debug!(
-                    "Range invalidation: failed to read journal file {:?}: {}",
-                    journal_path, e
-                );
-                continue;
-            }
-        };
-
-        for line in content.lines() {
-            if line.trim().is_empty() {
-                continue;
-            }
-
-            let entry: crate::journal_manager::JournalEntry = match serde_json::from_str(line) {
-                Ok(e) => e,
-                Err(_) => continue,
+        let entries =
+            match crate::journal_manager::read_entries_for_key(&journal_path, cache_key).await {
+                Ok(entries) => entries,
+                Err(e) => {
+                    debug!(
+                        "Range invalidation: failed to read journal file {:?}: {}",
+                        journal_path, e
+                    );
+                    continue;
+                }
             };
 
-            if entry.cache_key != cache_key {
-                continue;
-            }
+        for entry in entries {
             if entry.operation != crate::journal_manager::JournalOperation::Add {
                 continue;
             }
