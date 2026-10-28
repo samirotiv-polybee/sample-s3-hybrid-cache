@@ -316,6 +316,16 @@ path = "tests/multipart_write_cache_signed_range_race_e2e.rs"
 name = "origin_marker_test"
 path = "tests/origin_marker_test.rs"
 
+# pending_journal_lookup_cost_test: #[global_allocator] (one per binary) measuring one journal lookup's peak heap
+[[test]]
+name = "pending_journal_lookup_cost_test"
+path = "tests/pending_journal_lookup_cost_test.rs"
+
+# pending_journal_lookup_throughput_test: compares journal-lookup rates; a second test in the binary would perturb the timing
+[[test]]
+name = "pending_journal_lookup_throughput_test"
+path = "tests/pending_journal_lookup_throughput_test.rs"
+
 # permit_lifetime_integration_test: reads the process-global monotonic permits_held_peak() high-water mark (its own doc comment at :632)
 [[test]]
 name = "permit_lifetime_integration_test"

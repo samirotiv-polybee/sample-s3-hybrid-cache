@@ -152,10 +152,13 @@ pub(crate) async fn append_lines_locked_or_fresh(
 /// Read `cache_key`'s entries from one journal file, in file order.
 ///
 /// Each key a consolidation cycle processes reads the journal files discovery listed for it,
+/// and a cache lookup whose range no `.meta` lists yet reads every journal file
+/// (`DiskCacheManager::pending_journal_ranges_classified` and its siblings),
 /// up to `KEY_CONCURRENCY_LIMIT` keys at once. Loading each file whole and parsing every line
 /// held one copy of the journal per key in flight and cost a JSON parse per line per key, so a
 /// journal that had fallen behind took memory and CPU in proportion to its size times the key
-/// count, and fell further behind. This reads the file a line at a time on the blocking pool
+/// count, and fell further behind; on the lookup path that parse ran on the runtime's worker
+/// threads, once per lookup. This reads the file a line at a time on the blocking pool
 /// and parses only the lines that contain the key's JSON string: memory is one line, and a
 /// line for another key costs a substring search.
 ///
@@ -164,7 +167,7 @@ pub(crate) async fn append_lines_locked_or_fresh(
 /// lines contains that encoding, quotes included. A line that contains it for another reason
 /// is parsed and compared on `cache_key` as before. Unparseable lines are skipped, as before,
 /// and so is a line that is not valid UTF-8, where the whole-file read skipped the file.
-async fn read_entries_for_key(
+pub(crate) async fn read_entries_for_key(
     journal_file: &Path,
     cache_key: &str,
 ) -> std::io::Result<Vec<JournalEntry>> {
